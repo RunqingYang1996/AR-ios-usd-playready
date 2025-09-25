@@ -1,3 +1,4 @@
+ffmpeg -i output.mp4 -vframes 20000 %06d.jpg
 nohup python trainstylegan916.py \
     --dataset /home/ubuntu/float/results/data2 \
     --epochs 3000 \
