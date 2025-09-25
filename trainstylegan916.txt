@@ -1,0 +1,544 @@
+# stylegan2_from_pdf.py
+# Strict implementation mirroring the blog/PDF "Implementation StyleGAN2 from scratch"
+# + Checkpointing every 50 epochs (and resume)
+# + Safer image saving (creates folders)
+# + Optional --resume
+
+import os
+import math
+from math import log2, sqrt
+from dataclasses import dataclass
+from typing import Tuple, Optional
+
+import numpy as np
+import torch
+from torch import nn, optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from torchvision.utils import save_image
+from tqdm import tqdm
+
+# -----------------------------
+# Hyperparams (defaults = blog)
+# -----------------------------
+@dataclass
+class HParams:
+    dataset: str = "./DATASET"      # path passed to ImageFolder (must contain at least one subfolder)
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    epochs: int = 300
+    lr: float = 1e-3
+    batch_size: int = 32
+    log_resolution: int = 7         # 2**7 = 128
+    z_dim: int = 256                # blog uses 256 (paper often 512)
+    w_dim: int = 256
+    lambda_gp: float = 10.0         # WGAN-GP
+    plp_beta: float = 0.99          # PathLengthPenalty EMA beta
+
+# -----------------------------
+# Equalized layers & helpers
+# -----------------------------
+class EqualizedWeight(nn.Module):
+    # N(0,1) weights multiplied by c = 1/sqrt(prod(shape[1:])) at forward (like ProGAN)
+    def __init__(self, shape):
+        super().__init__()
+        self.c = 1 / sqrt(np.prod(shape[1:]))
+        self.weight = nn.Parameter(torch.randn(shape))
+
+    def forward(self):
+        return self.weight * self.c
+
+class EqualizedLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=0.0):
+        super().__init__()
+        self.weight = EqualizedWeight([out_features, in_features])
+        self.bias = nn.Parameter(torch.ones(out_features) * bias)
+
+    def forward(self, x: torch.Tensor):
+        return F.linear(x, self.weight(), bias=self.bias)
+
+class EqualizedConv2d(nn.Module):
+    def __init__(self, in_features, out_features, kernel_size, padding=0):
+        super().__init__()
+        self.padding = padding
+        self.weight = EqualizedWeight([out_features, in_features, kernel_size, kernel_size])
+        self.bias = nn.Parameter(torch.ones(out_features))
+
+    def forward(self, x: torch.Tensor):
+        return F.conv2d(x, self.weight(), bias=self.bias, padding=self.padding)
+
+class Conv2dWeightModulate(nn.Module):
+    # Weight modulation/demodulation as in StyleGAN2
+    def __init__(self, in_features, out_features, kernel_size, demodulate=True, eps=1e-8):
+        super().__init__()
+        self.out_features = out_features
+        self.demodulate = demodulate
+        self.padding = (kernel_size - 1) // 2
+        self.weight = EqualizedWeight([out_features, in_features, kernel_size, kernel_size])
+        self.eps = eps
+
+    def forward(self, x, s):
+        # x: [B, C_in, H, W], s: [B, C_in]
+        b, _, h, w = x.shape
+        s = s[:, None, :, None, None]                     # [B, 1, C_in, 1, 1]
+        weights = self.weight()[None, :, :, :, :]         # [1, C_out, C_in, k, k]
+        weights = weights * s                             # [B, C_out, C_in, k, k]
+
+        if self.demodulate:
+            sigma_inv = torch.rsqrt((weights ** 2).sum(dim=(2, 3, 4), keepdim=True) + self.eps)
+            weights = weights * sigma_inv
+
+        x = x.reshape(1, -1, h, w)                        # [1, B*C_in, H, W]
+        _, _, *ws = weights.shape
+        weights = weights.reshape(b * self.out_features, *ws)  # [B*C_out, C_in, k, k]
+
+        x = F.conv2d(x, weights, padding=self.padding, groups=b)
+        return x.reshape(-1, self.out_features, h, w)
+
+# -----------------------------
+# Mapping Network
+# -----------------------------
+class MappingNetwork(nn.Module):
+    # Blog uses 8 x (EqualizedLinear + ReLU); PixelNorm applied in forward
+    def __init__(self, z_dim, w_dim):
+        super().__init__()
+        layers = []
+        for _ in range(8):
+            layers += [EqualizedLinear(z_dim, w_dim), nn.ReLU()]
+        # last linear (no ReLU) per blog snippet
+        layers[-1] = EqualizedLinear(z_dim, w_dim)
+        self.mapping = nn.Sequential(*layers)
+
+    def forward(self, x):
+        # PixelNorm
+        x = x / torch.sqrt(torch.mean(x ** 2, dim=1, keepdim=True) + 1e-8)
+        return self.mapping(x)
+
+# -----------------------------
+# Generator
+# -----------------------------
+class StyleBlock(nn.Module):
+    def __init__(self, W_DIM, in_features, out_features):
+        super().__init__()
+        self.to_style = EqualizedLinear(W_DIM, in_features, bias=1.0)
+        self.conv = Conv2dWeightModulate(in_features, out_features, kernel_size=3)
+        self.scale_noise = nn.Parameter(torch.zeros(1))
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        self.activation = nn.LeakyReLU(0.2, True)
+
+    def forward(self, x, w, noise):
+        s = self.to_style(w)
+        x = self.conv(x, s)
+        if noise is not None:
+            x = x + self.scale_noise[None, :, None, None] * noise
+        return self.activation(x + self.bias[None, :, None, None])
+
+class ToRGB(nn.Module):
+    def __init__(self, W_DIM, features):
+        super().__init__()
+        self.to_style = EqualizedLinear(W_DIM, features, bias=1.0)
+        self.conv = Conv2dWeightModulate(features, 3, kernel_size=1, demodulate=False)
+        self.bias = nn.Parameter(torch.zeros(3))
+        self.activation = nn.LeakyReLU(0.2, True)
+
+    def forward(self, x, w):
+        style = self.to_style(w)
+        x = self.conv(x, style)
+        return self.activation(x + self.bias[None, :, None, None])
+
+class GeneratorBlock(nn.Module):
+    def __init__(self, W_DIM, in_features, out_features):
+        super().__init__()
+        self.style_block1 = StyleBlock(W_DIM, in_features, out_features)
+        self.style_block2 = StyleBlock(W_DIM, out_features, out_features)
+        self.to_rgb = ToRGB(W_DIM, out_features)
+
+    def forward(self, x, w, noise):
+        x = self.style_block1(x, w, noise[0])
+        x = self.style_block2(x, w, noise[1])
+        rgb = self.to_rgb(x, w)
+        return x, rgb
+
+class Generator(nn.Module):
+    # log_resolution: log2(image_size). e.g., 7 -> 128x128
+    def __init__(self, log_resolution, W_DIM, n_features=32, max_features=256):
+        super().__init__()
+        features = [min(max_features, n_features * (2 ** i)) for i in range(log_resolution - 2, -1, -1)]
+        self.n_blocks = len(features)
+
+        self.initial_constant = nn.Parameter(torch.randn((1, features[0], 4, 4)))
+        self.style_block = StyleBlock(W_DIM, features[0], features[0])
+        self.to_rgb = ToRGB(W_DIM, features[0])
+
+        blocks = [GeneratorBlock(W_DIM, features[i - 1], features[i]) for i in range(1, self.n_blocks)]
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, w, input_noise):
+        # w: [n_blocks, batch, W_DIM]  ; input_noise: list of (n1, n2) per block
+        batch_size = w.shape[1]
+        x = self.initial_constant.expand(batch_size, -1, -1, -1)
+        x = self.style_block(x, w[0], input_noise[0][1])      # first block uses only one noise (n2); n1=None
+        rgb = self.to_rgb(x, w[0])
+
+        for i in range(1, self.n_blocks):
+            x = F.interpolate(x, scale_factor=2, mode="bilinear")
+            x, rgb_new = self.blocks[i - 1](x, w[i], input_noise[i])
+            rgb = F.interpolate(rgb, scale_factor=2, mode="bilinear") + rgb_new
+
+        return torch.tanh(rgb)
+
+# -----------------------------
+# Discriminator
+# -----------------------------
+class DiscriminatorBlock(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.residual = nn.Sequential(
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            EqualizedConv2d(in_features, out_features, kernel_size=1),
+        )
+        self.block = nn.Sequential(
+            EqualizedConv2d(in_features, in_features, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, True),
+            EqualizedConv2d(in_features, out_features, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.down_sample = nn.AvgPool2d(kernel_size=2, stride=2)
+        self.scale = 1 / sqrt(2)
+
+    def forward(self, x):
+        residual = self.residual(x)
+        x = self.block(x)
+        x = self.down_sample(x)
+        return (x + residual) * self.scale
+
+class Discriminator(nn.Module):
+    def __init__(self, log_resolution, n_features=64, max_features=256):
+        super().__init__()
+        features = [min(max_features, n_features * (2 ** i)) for i in range(log_resolution - 1)]
+
+        self.from_rgb = nn.Sequential(
+            EqualizedConv2d(3, n_features, 1),
+            nn.LeakyReLU(0.2, True),
+        )
+        n_blocks = len(features) - 1
+        blocks = [DiscriminatorBlock(features[i], features[i + 1]) for i in range(n_blocks)]
+        self.blocks = nn.Sequential(*blocks)
+
+        final_features = features[-1] + 1  # +1 for minibatch std channel
+        self.conv = EqualizedConv2d(final_features, final_features, 3)
+        self.final = EqualizedLinear(2 * 2 * final_features, 1)
+
+    def minibatch_std(self, x):
+        # std per-example then mean over channels & spatial, repeat as single channel
+        batch_statistics = (torch.std(x, dim=0).mean().repeat(x.shape[0], 1, x.shape[2], x.shape[3]))
+        return torch.cat([x, batch_statistics], dim=1)
+
+    def forward(self, x):
+        x = self.from_rgb(x)
+        x = self.blocks(x)
+        x = self.minibatch_std(x)
+        x = self.conv(x)
+        x = x.reshape(x.shape[0], -1)
+        return self.final(x)
+
+# -----------------------------
+# Utils from the blog
+# -----------------------------
+def gradient_penalty(critic, real, fake, device="cpu"):
+    BATCH_SIZE, C, H, W = real.shape
+    beta = torch.rand((BATCH_SIZE, 1, 1, 1), device=device).repeat(1, C, H, W)
+    interpolated_images = real * beta + fake.detach() * (1 - beta)
+    interpolated_images.requires_grad_(True)
+
+    mixed_scores = critic(interpolated_images)
+    gradient = torch.autograd.grad(
+        inputs=interpolated_images,
+        outputs=mixed_scores,
+        grad_outputs=torch.ones_like(mixed_scores),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+    gradient = gradient.view(gradient.shape[0], -1)
+    gradient_norm = gradient.norm(2, dim=1)
+    gradient_pen = torch.mean((gradient_norm - 1) ** 2)
+    return gradient_pen
+
+class PathLengthPenalty(nn.Module):
+    # as in the article: keeps an EMA of the perceptual step
+    def __init__(self, beta):
+        super().__init__()
+        self.beta = beta
+        self.steps = nn.Parameter(torch.tensor(0.), requires_grad=False)
+        self.exp_sum_a = nn.Parameter(torch.tensor(0.), requires_grad=False)
+
+    def forward(self, w, x):
+        device = x.device
+        image_size = x.shape[2] * x.shape[3]
+        y = torch.randn(x.shape, device=device)
+
+        output = (x * y).sum() / sqrt(image_size)
+        gradients, *_ = torch.autograd.grad(
+            outputs=output,
+            inputs=w,
+            grad_outputs=torch.ones(output.shape, device=device),
+            create_graph=True,
+        )
+        norm = (gradients ** 2).sum(dim=2).mean(dim=1).sqrt()
+
+        if self.steps > 0:
+            a = self.exp_sum_a / (1 - self.beta ** self.steps)
+            loss = torch.mean((norm - a) ** 2)
+        else:
+            loss = norm.new_tensor(0)
+
+        mean = norm.mean().detach()
+        self.exp_sum_a.mul_(self.beta).add_(mean, alpha=1 - self.beta)
+        self.steps.add_(1.)
+        return loss
+
+# -----------------------------
+# Data loader exactly as blog
+# -----------------------------
+def get_loader(hp: HParams):
+    transform = transforms.Compose([
+        transforms.Resize((2 ** hp.log_resolution, 2 ** hp.log_resolution)),
+        transforms.ToTensor(),
+        #transforms.RandomHorizontalFlip(p=0.5),
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    ])
+    dataset = datasets.ImageFolder(root=hp.dataset, transform=transform)
+    loader = DataLoader(dataset, batch_size=hp.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    return loader
+
+# -----------------------------
+# Sampling helpers from blog
+# -----------------------------
+def get_w(batch_size, hp: HParams, mapping_network: MappingNetwork):
+    z = torch.randn(batch_size, hp.z_dim, device=hp.device)
+    w = mapping_network(z)                        # [B, W_DIM]
+    return w[None, :, :].expand(hp.log_resolution, -1, -1)  # [n_blocks, B, W_DIM]
+
+def get_noise(batch_size, hp: HParams):
+    noise = []
+    resolution = 4
+    for i in range(hp.log_resolution):
+        if i == 0:
+            n1 = None
+        else:
+            n1 = torch.randn(batch_size, 1, resolution, resolution, device=hp.device)
+        n2 = torch.randn(batch_size, 1, resolution, resolution, device=hp.device)
+        noise.append((n1, n2))
+        resolution *= 2
+    return noise
+
+@torch.no_grad()
+def generate_examples(gen: Generator, mapping_network: MappingNetwork, hp: HParams, epoch: int, n: int = 100):
+    gen.eval()
+    out_dir = f"saved_examples/epoch{epoch}"
+    os.makedirs(out_dir, exist_ok=True)
+    for i in range(n):
+        w = get_w(1, hp, mapping_network)
+        noise = get_noise(1, hp)
+        img = gen(w, noise).detach().cpu()
+        save_image(img * 0.5 + 0.5, os.path.join(out_dir, f"img_{i:03d}.png"))
+    gen.train()
+
+# -----------------------------
+# Checkpoint utils
+# -----------------------------
+def save_checkpoint(epoch: int,
+                    gen: Generator,
+                    critic: Discriminator,
+                    mapping: MappingNetwork,
+                    opt_g: optim.Optimizer,
+                    opt_c: optim.Optimizer,
+                    opt_m: optim.Optimizer,
+                    plp: PathLengthPenalty,
+                    hp: HParams,
+                    tag: Optional[str] = None):
+    os.makedirs("checkpoints", exist_ok=True)
+    name = f"epoch_{epoch:04d}.pt" if tag is None else f"{tag}.pt"
+    path = os.path.join("checkpoints", name)
+    torch.save({
+        "epoch": epoch,
+        "hp": hp.__dict__,  # store hyperparams for rebuild
+        "gen": gen.state_dict(),
+        "critic": critic.state_dict(),
+        "mapping": mapping.state_dict(),
+        "opt_g": opt_g.state_dict(),
+        "opt_c": opt_c.state_dict(),
+        "opt_m": opt_m.state_dict(),
+        "plp": plp.state_dict(),
+    }, path)
+    return path
+
+def load_checkpoint(path: str,
+                    gen: Generator,
+                    critic: Discriminator,
+                    mapping: MappingNetwork,
+                    opt_g: optim.Optimizer,
+                    opt_c: optim.Optimizer,
+                    opt_m: optim.Optimizer,
+                    plp: PathLengthPenalty):
+    ckpt = torch.load(path, map_location="cpu")
+    gen.load_state_dict(ckpt["gen"])
+    critic.load_state_dict(ckpt["critic"])
+    mapping.load_state_dict(ckpt["mapping"])
+    if "opt_g" in ckpt: opt_g.load_state_dict(ckpt["opt_g"])
+    if "opt_c" in ckpt: opt_c.load_state_dict(ckpt["opt_c"])
+    if "opt_m" in ckpt: opt_m.load_state_dict(ckpt["opt_m"])
+    if "plp" in ckpt: plp.load_state_dict(ckpt["plp"])
+    start_epoch = ckpt.get("epoch", -1) + 1
+    return start_epoch, ckpt.get("hp", None)
+
+# -----------------------------
+# Train loop exactly as blog
+# -----------------------------
+def train_fn(
+    critic: Discriminator,
+    gen: Generator,
+    path_length_penalty: PathLengthPenalty,
+    loader: DataLoader,
+    opt_critic,
+    opt_gen,
+    opt_mapping_network,
+    mapping_network: MappingNetwork,
+    hp: HParams,
+):
+    loop = tqdm(loader, leave=True)
+    use_autocast = (hp.device == "cuda")
+
+    for batch_idx, (real, _) in enumerate(loop):
+        real = real.to(hp.device, non_blocking=True)
+        cur_batch_size = real.shape[0]
+
+        w = get_w(cur_batch_size, hp, mapping_network)
+        noise = get_noise(cur_batch_size, hp)
+        with torch.cuda.amp.autocast(enabled=use_autocast):
+            fake = gen(w, noise)
+            critic_fake = critic(fake.detach())
+            critic_real = critic(real)
+            gp = gradient_penalty(critic, real, fake, device=hp.device)
+            loss_critic = (
+                -(torch.mean(critic_real) - torch.mean(critic_fake))
+                + hp.lambda_gp * gp
+                + (0.001 * torch.mean(critic_real ** 2))  # drift
+            )
+
+        critic.zero_grad(set_to_none=True)
+        loss_critic.backward()
+        opt_critic.step()
+
+        gen_fake = critic(fake)
+        loss_gen = -torch.mean(gen_fake)
+
+        if batch_idx % 16 == 0:
+            plp = path_length_penalty(w, fake)
+            if not torch.isnan(plp):
+                loss_gen = loss_gen + plp
+
+        mapping_network.zero_grad(set_to_none=True)
+        gen.zero_grad(set_to_none=True)
+        loss_gen.backward()
+        opt_gen.step()
+        opt_mapping_network.step()
+
+        loop.set_postfix(gp=float(gp.item()), loss_critic=float(loss_critic.item()))
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", type=str, required=True,
+                    help="Path passed to torchvision.datasets.ImageFolder. Must contain at least one subfolder with images.")
+    ap.add_argument("--epochs", type=int, default=300)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--log_resolution", type=int, default=7)  # 128x128
+    ap.add_argument("--z_dim", type=int, default=256)
+    ap.add_argument("--w_dim", type=int, default=256)
+    ap.add_argument("--lambda_gp", type=float, default=10.0)
+    ap.add_argument("--resume", type=str, default="", help="Path to checkpoint .pt to resume from")
+    args = ap.parse_args()
+
+    hp = HParams(
+        dataset=args.dataset,
+        epochs=args.epochs,
+        lr=args.lr,
+        batch_size=args.batch_size,
+        log_resolution=args.log_resolution,
+        z_dim=args.z_dim,
+        w_dim=args.w_dim,
+        lambda_gp=args.lambda_gp,
+    )
+
+    device = torch.device(hp.device)
+    loader = get_loader(hp)
+
+    gen = Generator(hp.log_resolution, hp.w_dim).to(device)
+    critic = Discriminator(hp.log_resolution).to(device)
+    mapping_network = MappingNetwork(hp.z_dim, hp.w_dim).to(device)
+    path_length_penalty = PathLengthPenalty(hp.plp_beta).to(device)
+
+    opt_gen = optim.Adam(gen.parameters(), lr=hp.lr, betas=(0.0, 0.99))
+    opt_critic = optim.Adam(critic.parameters(), lr=hp.lr, betas=(0.0, 0.99))
+    opt_mapping_network = optim.Adam(mapping_network.parameters(), lr=hp.lr, betas=(0.0, 0.99))
+
+    gen.train(); critic.train(); mapping_network.train()
+
+    # ---- Resume support ----
+    start_epoch = 0
+    if args.resume and os.path.isfile(args.resume):
+        start_epoch, hp_from_ckpt = load_checkpoint(
+            args.resume, gen, critic, mapping_network,
+            opt_gen, opt_critic, opt_mapping_network, path_length_penalty
+        )
+        # 保守做法：以 ckpt 的 log_resolution / dims 为准重新构网（若不同）
+        if hp_from_ckpt is not None:
+            ck = hp_from_ckpt
+            need_rebuild = (ck.get("log_resolution", hp.log_resolution) != hp.log_resolution) or \
+                           (ck.get("w_dim", hp.w_dim) != hp.w_dim) or \
+                           (ck.get("z_dim", hp.z_dim) != hp.z_dim)
+            if need_rebuild:
+                print("Rebuilding nets to match checkpoint hyperparams...")
+                hp.log_resolution = ck.get("log_resolution", hp.log_resolution)
+                hp.w_dim = ck.get("w_dim", hp.w_dim)
+                hp.z_dim = ck.get("z_dim", hp.z_dim)
+                gen = Generator(hp.log_resolution, hp.w_dim).to(device)
+                critic = Discriminator(hp.log_resolution).to(device)
+                mapping_network = MappingNetwork(hp.z_dim, hp.w_dim).to(device)
+                # 重新 load
+                load_checkpoint(args.resume, gen, critic, mapping_network,
+                                opt_gen, opt_critic, opt_mapping_network, path_length_penalty)
+
+        print(f"Resumed from {args.resume}, start_epoch={start_epoch}")
+
+    # ---- Training epochs ----
+    for epoch in range(start_epoch, hp.epochs):
+        train_fn(
+            critic=critic,
+            gen=gen,
+            path_length_penalty=path_length_penalty,
+            loader=loader,
+            opt_critic=opt_critic,
+            opt_gen=opt_gen,
+            opt_mapping_network=opt_mapping_network,
+            mapping_network=mapping_network,
+            hp=hp,
+        )
+
+        # 每 50 epoch 存一次（并在这些点位出图）
+        if (epoch + 1) % 50 == 0:
+            generate_examples(gen, mapping_network, hp, epoch + 1, n=100)
+            ck = save_checkpoint(epoch + 1, gen, critic, mapping_network,
+                                 opt_gen, opt_critic, opt_mapping_network,
+                                 path_length_penalty, hp, tag=f"epoch_{epoch+1:04d}")
+            print(f"Saved checkpoint: {ck}")
+
+        # 也可以额外存一个最新的（可注释掉）
+        save_checkpoint(epoch + 1, gen, critic, mapping_network,
+                        opt_gen, opt_critic, opt_mapping_network,
+                        path_length_penalty, hp, tag="latest")
+
+if __name__ == "__main__":
+    main()
